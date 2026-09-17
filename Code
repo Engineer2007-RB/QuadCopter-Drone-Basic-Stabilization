@@ -1,0 +1,524 @@
+#include <ESP8266WiFi.h>
+#include <WebSocketsServer.h>
+#include <ESP8266WebServer.h>
+#include <Wire.h>
+#include <MPU6050.h>
+
+// WiFi AP settings
+const char* ssid = "Rudra's Drone";
+const char* password = "Rudra2007";
+
+// WebServer and WebSocket
+ESP8266WebServer server(80);
+WebSocketsServer webSocket(81);
+
+// MPU6050
+MPU6050 mpu;
+
+// ----- Kalman Filter Parameters -----
+float Q_angle_roll = 0.001, Q_bias_roll = 0.003, R_measure_roll = 0.05;
+float Q_angle_pitch = 0.001, Q_bias_pitch = 0.003, R_measure_pitch = 0.05;
+float roll = 0, bias_roll = 0, P_roll[2][2] = {{0,0},{0,0}};
+float pitch = 0, bias_pitch = 0, P_pitch[2][2] = {{0,0},{0,0}};
+
+// ----- Pins for ESCs and Spray -----
+const int escPin1 = 14;  // D5, Front-Left
+const int escPin2 = 12;  // D6, Front-Right
+const int escPin3 = 13;  // D7, Back-Right
+const int escPin4 = 15;  // D8, Back-Left
+const int sprayPin = 16; // D0, Spray control
+
+// ----- PWM Settings -----
+const int PWM_FREQ = 400;  // Hz, suitable for SimonK ESCs
+const int PWM_RES = 1023;  // ESP8266 PWM resolution
+const float PERIOD_US = 1000000.0 / PWM_FREQ;  // 2500 µs for 400 Hz
+
+// ----- IMU Data and Timing -----
+int16_t ax, ay, az, gx, gy, gz;
+float gyroOffsets[3] = {0, 0, 0};
+float accelOffsets[3] = {0, 0, 0};
+unsigned long prevTime = 0;
+float dt = 0.0;
+
+// ----- Filtered Angles and Rates -----
+float angles[3] = {0, 0, 0}; // angles[0]: roll, angles[1]: pitch, angles[2]: yaw
+float rates[3] = {0, 0, 0};  // rates[0]: roll rate, rates[1]: pitch rate, rates[2]: yaw rate
+
+// ----- PID Parameters for Rate Control -----
+float kp_rate = 5.5, ki_rate = 0.01, kd_rate = 0.12;
+float int_rate_roll = 0, prev_err_rate_roll = 0;
+float int_rate_pitch = 0, prev_err_rate_pitch = 0;
+float int_rate_yaw = 0, prev_err_rate_yaw = 0;
+
+// ----- LQR Parameters for Angle Control -----
+float K_angle[2] = {2.9, 0.01};  // [angle_gain, rate_gain] for roll/pitch
+float default_K_angle[2] = {2.9, 0.01};
+
+// ----- Desired Setpoints -----
+float desired_angles[3] = {0, 0, 0};
+float desired_rates[3] = {0, 0, 0};
+
+// ----- Base Throttle -----
+int base_throttle = 1700;  // Adjusted for 500g payload hover
+bool stabilityMode = false;
+bool sprayState = false;
+
+// ----- HTML Content -----
+const char* htmlPage = R"=====(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Drone Control Interface</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+      background-color: #f0f0f0;
+    }
+    .container {
+      background-color: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+      text-align: center;
+      max-width: 400px;
+      width: 100%;
+    }
+    h1 {
+      font-size: 24px;
+      margin-bottom: 20px;
+    }
+    button {
+      padding: 10px 20px;
+      margin: 5px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 16px;
+      transition: background-color 0.2s;
+    }
+    .btn-blue { background-color: #007bff; color: white; }
+    .btn-blue:hover { background-color: #0056b3; }
+    .btn-green { background-color: #28a745; color: white; }
+    .btn-green:hover { background-color: #1e7e34; }
+    .btn-red { background-color: #dc3545; color: white; }
+    .btn-red:hover { background-color: #b02a37; }
+    .btn-gray { background-color: #6c757d; color: white; }
+    .btn-gray:hover { background-color: #545b62; }
+    .slider-container {
+      margin: 20px 0;
+    }
+    input[type="range"] {
+      width: 80%;
+    }
+    .status {
+      margin-top: 10px;
+      font-size: 14px;
+      color: #333;
+    }
+  </style>
+</head>
+<body>
+  <div id="container" class="container"></div>
+  <script>
+    let ws = null;
+    let isStabilizing = false;
+    let isSprayOn = false;
+    let throttle = 1700;
+
+    function connectWebSocket() {
+      ws = new WebSocket('ws://192.168.4.1:81');
+      ws.onopen = () => console.log('WebSocket Connected');
+      ws.onclose = () => {
+        console.log('WebSocket Disconnected');
+        setTimeout(connectWebSocket, 5000);
+      };
+      ws.onerror = (error) => console.error('WebSocket Error:', error);
+    }
+
+    function showMainPage() {
+      const container = document.getElementById('container');
+      container.innerHTML = `
+        <h1>Drone Control</h1>
+        <button class="btn-blue" onclick="showStabilityPage()">Stability Flight</button>
+        <button class="btn-green" onclick="showSprayPage()">Spray Operating</button>
+      `;
+    }
+
+    function showStabilityPage() {
+      const container = document.getElementById('container');
+      container.innerHTML = `
+        <h1>Stability Flight Control</h1>
+        <div class="slider-container">
+          <label>Base Throttle: <span id="throttle-value">${throttle}</span></label>
+          <input type="range" id="throttle-slider" min="1000" max="2000" value="${throttle}">
+        </div>
+        <button class="${isStabilizing ? 'btn-red' : 'btn-green'}" onclick="toggleStabilize()">
+          ${isStabilizing ? 'Stop Stabilization' : 'Start Stabilization'}
+        </button>
+        <button class="btn-gray" onclick="showMainPage()">Back</button>
+        <div class="status" id="status">Status: ${isStabilizing ? 'Stabilizing' : 'Idle'}</div>
+      `;
+      const slider = document.getElementById('throttle-slider');
+      const throttleValue = document.getElementById('throttle-value');
+      slider.addEventListener('input', () => {
+        throttle = slider.value;
+        throttleValue.textContent = throttle;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(`throttle:${throttle}`);
+        }
+      });
+    }
+
+    function showSprayPage() {
+      const container = document.getElementById('container');
+      container.innerHTML = `
+        <h1>Spray Control</h1>
+        <button class="${isSprayOn ? 'btn-red' : 'btn-green'}" onclick="toggleSpray()">
+          ${isSprayOn ? 'Turn Spray OFF' : 'Turn Spray ON'}
+        </button>
+        <button class="btn-gray" onclick="showMainPage()">Back</button>
+        <div class="status">Status: Spray ${isSprayOn ? 'ON' : 'OFF'}</div>
+      `;
+    }
+
+    function toggleStabilize() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        if (isStabilizing) {
+          ws.send('stabilize_off');
+          isStabilizing = false;
+        } else {
+          ws.send('stabilize_on');
+          isStabilizing = true;
+        }
+        showStabilityPage();
+      } else {
+        alert('WebSocket not connected. Please ensure you are connected to DroneAP.');
+      }
+    }
+
+    function toggleSpray() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        if (isSprayOn) {
+          ws.send('spray_off');
+          isSprayOn = false;
+        } else {
+          ws.send('spray_on');
+          isSprayOn = true;
+        }
+        showSprayPage();
+      } else {
+        alert('WebSocket not connected. Please ensure you are connected to DroneAP.');
+      }
+    }
+
+    connectWebSocket();
+    showMainPage();
+  </script>
+</body>
+</html>
+)=====";
+
+// ----- Function Prototypes -----
+void setupMPU6050();
+void calibrateIMU();
+float kalmanFilter(float newAngle, float newRate, float dt, float &angle, float &bias, float P[2][2], float Q_angle, float Q_bias, float R_measure);
+float computePID(float error, float &integral, float &prev_error, float kp, float ki, float kd, float dt);
+void readIMU();
+void updateAnglesAndRates();
+void computeControls(float &u_roll, float &u_pitch, float &u_yaw);
+void mixMotors(int &m1, int &m2, int &m3, int &m4, float u_roll, float u_pitch, float u_yaw);
+void sendToESCs(int m1, int m2, int m3, int m4);
+void armESCs();
+void killMotors();
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(4, 5);  // SDA, SCL pins for ESP8266
+  Wire.setClock(400000);
+  
+  // Initialize MPU6050
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed!");
+    while (1);
+  }
+  Serial.println("MPU6050 connected.");
+  mpu.setDLPFMode(MPU6050_DLPF_BW_42);
+  calibrateIMU();
+  
+  // Setup pins
+  pinMode(escPin1, OUTPUT);
+  pinMode(escPin2, OUTPUT);
+  pinMode(escPin3, OUTPUT);
+  pinMode(escPin4, OUTPUT);
+  pinMode(sprayPin, OUTPUT);
+  digitalWrite(sprayPin, LOW); // Spray off by default
+  analogWriteFreq(PWM_FREQ);
+  analogWriteRange(PWM_RES);
+  
+  // Setup WiFi AP
+  WiFi.softAP(ssid, password);
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+  
+  // Web server routes
+  server.on("/", []() {
+    server.send(200, "text/html", htmlPage);
+  });
+  server.begin();
+  
+  // WebSocket
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  
+  prevTime = micros();
+}
+
+void loop() {
+  webSocket.loop();
+  server.handleClient();
+  
+  if (stabilityMode) {
+    unsigned long currentTime = micros();
+    dt = (currentTime - prevTime) / 1000000.0;
+    prevTime = currentTime;
+    
+    if (dt > 0.1) dt = 0.01;
+    
+    readIMU();
+    updateAnglesAndRates();
+    
+    float u_roll, u_pitch, u_yaw;
+    computeControls(u_roll, u_pitch, u_yaw);
+    
+    int m1, m2, m3, m4;
+    mixMotors(m1, m2, m3, m4, u_roll, u_pitch, u_yaw);
+    
+    sendToESCs(m1, m2, m3, m4);
+    
+    // Safety Cutoff
+    if (abs(angles[0]) > 45 || abs(angles[1]) > 45) {
+      killMotors();
+      stabilityMode = false;
+      Serial.println("Safety Triggered! Motors OFF");
+    }
+  } else {
+    killMotors();
+  }
+  
+  digitalWrite(sprayPin, sprayState ? HIGH : LOW);
+}
+
+// WebSocket event handler
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_TEXT) {
+    String msg = "";
+    for (size_t i = 0; i < length; i++) {
+      msg += (char)payload[i];
+    }
+    if (msg.startsWith("throttle:")) {
+      base_throttle = msg.substring(9).toInt();
+      base_throttle = constrain(base_throttle, 1000, 2000);
+      Serial.print("Base Throttle: "); Serial.println(base_throttle);
+    } else if (msg == "stabilize_on") {
+      stabilityMode = true;
+      armESCs();
+      Serial.println("Stability Mode ON");
+    } else if (msg == "stabilize_off") {
+      stabilityMode = false;
+      killMotors();
+      Serial.println("Stability Mode OFF");
+    } else if (msg == "spray_on") {
+      sprayState = true;
+      Serial.println("Spray ON");
+    } else if (msg == "spray_off") {
+      sprayState = false;
+      Serial.println("Spray OFF");
+    }
+  }
+}
+
+// MPU6050 and Control Functions
+void setupMPU6050() {
+  Wire.begin(4, 5);
+  Wire.setClock(400000);
+  mpu.setDLPFMode(MPU6050_DLPF_BW_42);
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 failed");
+    while (1);
+  }
+  Serial.println("MPU6050 OK");
+}
+
+void calibrateIMU() {
+  Serial.println("Calibrating IMU... Keep drone still on a flat surface.");
+  const int num_samples = 500;
+  long sum_gx = 0, sum_gy = 0, sum_gz = 0;
+  long sum_ax = 0, sum_ay = 0, sum_az = 0;
+  
+  for (int i = 0; i < num_samples; i++) {
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    sum_ax += ax;
+    sum_ay += ay;
+    sum_az += az;
+    sum_gx += gx;
+    sum_gy += gy;
+    sum_gz += gz;
+    delay(3);
+  }
+  
+  gyroOffsets[0] = sum_gx / (float)num_samples;
+  gyroOffsets[1] = sum_gy / (float)num_samples;
+  gyroOffsets[2] = sum_gz / (float)num_samples;
+  
+  accelOffsets[0] = sum_ax / (float)num_samples;
+  accelOffsets[1] = sum_ay / (float)num_samples;
+  accelOffsets[2] = sum_az / (float)num_samples - 16384;
+  
+  Serial.print("Gyro Offsets: gx="); Serial.print(gyroOffsets[0]);
+  Serial.print(" gy="); Serial.print(gyroOffsets[1]);
+  Serial.print(" gz="); Serial.println(gyroOffsets[2]);
+  Serial.print("Accel Offsets: ax="); Serial.print(accelOffsets[0]);
+  Serial.print(" ay="); Serial.print(accelOffsets[1]);
+  Serial.print(" az="); Serial.println(accelOffsets[2]);
+  Serial.println("Calibration complete.");
+}
+
+float kalmanFilter(float newAngle, float newRate, float dt, float &angle, float &bias, float P[2][2], float Q_angle, float Q_bias, float R_measure) {
+  float rate = newRate - bias;
+  angle += dt * rate;
+  P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + Q_angle);
+  P[0][1] -= dt * P[1][1];
+  P[1][0] -= dt * P[1][1];
+  P[1][1] += Q_bias * dt;
+  
+  float S = P[0][0] + R_measure;
+  float K0 = P[0][0] / S;
+  float K1 = P[1][0] / S;
+  
+  float y_err = newAngle - angle;
+  angle += K0 * y_err;
+  bias += K1 * y_err;
+  
+  float P00 = P[0][0], P01 = P[0][1];
+  P[0][0] -= K0 * P00;
+  P[0][1] -= K0 * P01;
+  P[1][0] -= K1 * P00;
+  P[1][1] -= K1 * P01;
+  
+  return angle;
+}
+
+float computePID(float error, float &integral, float &prev_error, float kp, float ki, float kd, float dt) {
+  integral += error * dt;
+  integral = constrain(integral, -100, 100);
+  float derivative = (error - prev_error) / dt;
+  prev_error = error;
+  return kp * error + ki * integral + kd * derivative;
+}
+
+void readIMU() {
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+}
+
+void updateAnglesAndRates() {
+  rates[0] = (gx - gyroOffsets[0]) / 131.0;
+  rates[1] = (gy - gyroOffsets[1]) / 131.0;
+  rates[2] = (gz - gyroOffsets[2]) / 131.0;
+  
+  float ax_g = (ax - accelOffsets[0]) / 16384.0;
+  float ay_g = (ay - accelOffsets[1]) / 16384.0;
+  float az_g = (az - accelOffsets[2]) / 16384.0;
+  
+  float denom = sqrt(ay_g * ay_g + az_g * az_g);
+  if (denom < 1e-3) denom = 1e-3;
+  float accelPitch = atan2(-ax_g, denom) * 180 / PI;
+  float accelRoll = atan2(ay_g, az_g) * 180 / PI;
+  
+  angles[0] = kalmanFilter(accelRoll, rates[0], dt, roll, bias_roll, P_roll, Q_angle_roll, Q_bias_roll, R_measure_roll);
+  angles[1] = kalmanFilter(accelPitch, rates[1], dt, pitch, bias_pitch, P_pitch, Q_angle_pitch, Q_bias_pitch, R_measure_pitch);
+  angles[2] += rates[2] * dt;
+  
+  if (isnan(angles[0]) || isnan(angles[1])) {
+    angles[0] = angles[1] = roll = pitch = bias_roll = bias_pitch = 0;
+  }
+}
+
+void computeControls(float &u_roll, float &u_pitch, float &u_yaw) {
+  desired_rates[0] = -K_angle[0] * (angles[0] - desired_angles[0]) - K_angle[1] * rates[0];
+  desired_rates[1] = -K_angle[0] * (angles[1] - desired_angles[1]) - K_angle[1] * rates[1];
+  desired_rates[2] = 0.0;
+  
+  desired_rates[0] = constrain(desired_rates[0], -200, 200);
+  desired_rates[1] = constrain(desired_rates[1], -200, 200);
+  
+  float err_rate_roll = desired_rates[0] - rates[0];
+  u_roll = computePID(err_rate_roll, int_rate_roll, prev_err_rate_roll, kp_rate, ki_rate, kd_rate, dt);
+  
+  float err_rate_pitch = desired_rates[1] - rates[1];
+  u_pitch = computePID(err_rate_pitch, int_rate_pitch, prev_err_rate_pitch, kp_rate, ki_rate, kd_rate, dt);
+  
+  float err_rate_yaw = desired_rates[2] - rates[2];
+  u_yaw = computePID(err_rate_yaw, int_rate_yaw, prev_err_rate_yaw, kp_rate, ki_rate, kd_rate, dt);
+  
+  u_roll = constrain(u_roll, -300, 300);
+  u_pitch = constrain(u_pitch, -300, 300);
+  u_yaw = constrain(u_yaw, -300, 300);
+}
+
+void mixMotors(int &m1, int &m2, int &m3, int &m4, float u_roll, float u_pitch, float u_yaw) {
+  m1 = base_throttle + (int)u_pitch - (int)u_roll - (int)u_yaw;
+  m2 = base_throttle - (int)u_pitch - (int)u_roll + (int)u_yaw;
+  m3 = base_throttle - (int)u_pitch + (int)u_roll - (int)u_yaw;
+  m4 = base_throttle + (int)u_pitch + (int)u_roll + (int)u_yaw;
+  
+  m1 = constrain(m1, 1000, 2000);
+  m2 = constrain(m2, 1000, 2000);
+  m3 = constrain(m3, 1000, 2000);
+  m4 = constrain(m4, 1000, 2000);
+}
+
+void sendToESCs(int m1, int m2, int m3, int m4) {
+  int pwm1 = (int)((float)m1 / PERIOD_US * PWM_RES);
+  int pwm2 = (int)((float)m2 / PERIOD_US * PWM_RES);
+  int pwm3 = (int)((float)m3 / PERIOD_US * PWM_RES);
+  int pwm4 = (int)((float)m4 / PERIOD_US * PWM_RES);
+  
+  pwm1 = constrain(pwm1, 0, PWM_RES);
+  pwm2 = constrain(pwm2, 0, PWM_RES);
+  pwm3 = constrain(pwm3, 0, PWM_RES);
+  pwm4 = constrain(pwm4, 0, PWM_RES);
+  
+  analogWrite(escPin1, pwm1);
+  analogWrite(escPin2, pwm2);
+  analogWrite(escPin3, pwm3);
+  analogWrite(escPin4, pwm4);
+}
+
+void armESCs() {
+  Serial.println("Arming ESCs...");
+  int arm_pwm = (int)(1000.0 / PERIOD_US * PWM_RES);
+  analogWrite(escPin1, arm_pwm);
+  analogWrite(escPin2, arm_pwm);
+  analogWrite(escPin3, arm_pwm);
+  analogWrite(escPin4, arm_pwm);
+  delay(3000);
+  Serial.println("ESCs armed.");
+}
+
+void killMotors() {
+  int min_pwm = (int)(1000.0 / PERIOD_US * PWM_RES);
+  analogWrite(escPin1, min_pwm);
+  analogWrite(escPin2, min_pwm);
+  analogWrite(escPin3, min_pwm);
+  analogWrite(escPin4, min_pwm);
+}
